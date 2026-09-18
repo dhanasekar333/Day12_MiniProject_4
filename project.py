@@ -47,15 +47,16 @@ embeddings = HuggingFaceEmbeddings(
 INDEX_PATH = "faiss_index"
 start = time.time()
 if os.path.exists(INDEX_PATH):
-    vectorstore = faiss.load_local(
+    vectorstore = FAISS.load_local(
         INDEX_PATH,
         embeddings,
         allow_dangerous_deserialization = True
     )
 else:
-    vectorstore = faiss.from_documents(chunks,embeddings)
+    vectorstore = FAISS.from_documents(chunks,embeddings)
     vectorstore.save_local(INDEX_PATH)
 end = time.time()
+print(f"Index loading time: {end - start} seconds")
 
 retriever = vectorstore.as_retriever(
     search_type = "similarity",
@@ -73,8 +74,10 @@ retriever2 = vectorstore.as_retriever(
 
 prompt = ChatPromptTemplate.from_messages([
     ("system","""You're a helpful assistant, answer the question that user asks using the context.
-        If answer is not in the context, say I don't know. Keep answers concise and accurate."""),
-    Messagesplaceholder(variable_name = "chat_history"),
+        If answer is not in the context, say I don't know. Keep answers concise and accurate.
+        
+        context = {context}"""),
+    MessagesPlaceholder(variable_name = "chat_history"),
     ("human","{input}")
 ])
 
@@ -84,7 +87,7 @@ context_chain = itemgetter("input")|retriever
 context_chain_2 = itemgetter("input")|retriever2
 
 store = {}
-def session_history(session_id:str)->InMemoryChat:
+def session_history(session_id:str)->InMemoryChatMessageHistory:
     if session_id not in store:
         store[session_id] = InMemoryChatMessageHistory()
     return store[session_id]
@@ -101,20 +104,24 @@ deep_chain = RunnableParallel(
     context = context_chain_2
 )|prompt|llm|StrOutputParser()
 
-branch = RunnableBranch(
-    (lambda x: x['mode'].lower().strip() == "chat",qa_chain),
-    deep_chain
+
+chat_with_memory = RunnableWithMessageHistory(
+    qa_chain,
+    session_history,
+    input_messages_key = "input",
+    history_messages_key = "chat_history"
 )
 
-chain_with_memory = RunnableWithMessageHistory(
-    branch,
+deep_with_memory = RunnableWithMessageHistory(
+    deep_chain,
     session_history,
     input_messages_key = "input",
     history_messages_key = "chat_history"
 )
 
 def ask(session_id:str,mode:str,question:str)->str:
-    result = answer_with_memory.invoke(
+    chain = chat_with_memory if mode == "chat" else deep_with_memory
+    result = chain.invoke(
         {"input":question},
         config = {"configurable":{"session_id":session_id}}
     )
@@ -122,16 +129,45 @@ def ask(session_id:str,mode:str,question:str)->str:
     print(f"YOU: {question}")
     print(f"BOT: {result}")
 
+def inspect_session(session_id:str)->dict:
+    history = store.get(session_id)
+    if not history or not history.messages:
+        print(f"{session_id} is empty")
+        return {}
+
+    messages = history.messages
+    total_messages = len(messages)
+
+    human_messages = [msg for msg in messages if msg.__class__.__name__ == "HumanMessage"]
+    ai_messages = [msg for msg in messages if msg.__class__.__name__ == "AIMessage"]
+
+    first_question = human_messages[0].content if human_messages else "No questions asked"
+    last_answer = ai_messages[-1].content if ai_messages else "No answers given"
+
+    return {
+        "session_id":     session_id,
+        "total_messages": total_messages,
+        "human_messages": len(human_messages),
+        "ai_messages":    len(ai_messages),
+        "first_question": first_question[:100],
+        "last_answer":    last_answer[:100],
+    }
+
 if __name__ == "__main__":
     print("----------Get into the world of 'GAME OF THRONES'")
     print("type 'quit' to exit")
     print("Available Modes: \n chat, \n deep")
+
+    session_id = input("Please enter your name:")
+    print(f"Welcome {session_id}!\n")
     while True:
-        mode = input("select the mode:")
+        mode = input("select the mode:").strip().lower()
         if mode in ["chat","deep"]:
-            question = input("enter your question:")
+            question = input("enter your question:").strip()
             if question.lower() == "quit":
                 break
             ask(session_id,mode,question)
         else:
             print("Invalid Mode. Please enter the available modes")
+    print("\n===== SESSION SUMMARY =====")
+    print(json.dumps(inspect_session(session_id), indent=4))
